@@ -1,0 +1,23 @@
+name: Windows native portable EXE
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: rustup show
+      - run: node scripts/build-native.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CongSpeak-Native-windows-x64
+          path: |
+            releases/windows/CongSpeak-Native-*.exe
+            releases/windows/CongSpeak-Native-*.sha256
+            releases/windows/native-build-info.json
+          if-no-files-found: error

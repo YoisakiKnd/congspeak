@@ -1,0 +1,22 @@
+[package]
+name = "congspeak-teamspeak"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+congspeak-core.workspace = true
+tokio = { workspace = true, features = ["fs"] }
+tempfile = "3"
+tsproto-types = { git = "https://github.com/ReSpeak/tsclientlib.git", rev = "ee3bc6f45a7137db7793ba5593a321df400d53e5" }
+futures.workspace = true
+tsclientlib = { workspace = true, features = ["unstable"] }
+tsproto = { git = "https://github.com/ReSpeak/tsclientlib.git", rev = "ee3bc6f45a7137db7793ba5593a321df400d53e5" }
+serde_json.workspace = true
+congspeak-audio = { path = "../audio", features = ["runtime"] }
+tsproto-packets.workspace = true
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+audiopus = "0.3.0-rc.0"

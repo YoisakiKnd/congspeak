@@ -1,0 +1,43 @@
+[package]
+name = "congspeak-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+webrtc = ["dep:webrtc-audio-processing"]
+runtime = ["dep:sonora", "dep:sonora-agc2", "dep:sonora-simd", "dep:ringbuf", "dep:audiopus", "dep:audiopus_sys", "dep:tokio", "dep:tsclientlib", "dep:tsproto-packets", "dep:congspeak-core"]
+
+[dependencies]
+cpal = "0.18"
+nnnoiseless = { version = "0.5", default-features = false }
+webrtc-audio-processing = { version = "~2.1.0", features = ["bundled"], optional = true }
+congspeak-core = { workspace = true, optional = true }
+sonora = { version = "=0.3.0", optional = true }
+sonora-agc2 = { version = "=0.3.0", optional = true }
+sonora-simd = { version = "=0.3.0", optional = true }
+ringbuf = { version = "0.4", optional = true }
+audiopus = { version = "0.3.0-rc.0", optional = true }
+audiopus_sys = { version = "0.2.2", features = ["static"], optional = true }
+tokio = { workspace = true, optional = true }
+tsclientlib = { workspace = true, features = ["audio"], optional = true }
+tsproto-packets = { workspace = true, optional = true }
+
+[[example]]
+name = "audio_probe"
+
+[[example]]
+name = "runtime_smoke"
+required-features = ["runtime"]
+
+[[example]]
+name = "capture_smoke"
+required-features = ["runtime"]
+
+[[example]]
+name = "stability_smoke"
+required-features = ["runtime"]
+
+[[example]]
+name = "memory_probe"
+required-features = ["runtime"]

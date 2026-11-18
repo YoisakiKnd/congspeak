@@ -1,0 +1,12 @@
+/target/
+**/node_modules/
+**/dist/
+**/gen/
+.DS_Store
+.env
+.env.*
+!.env.example
+*.log
+*.tsbuildinfo
+/releases/
+/.xwin-cache/

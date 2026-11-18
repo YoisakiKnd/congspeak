@@ -1,0 +1,3 @@
+[env]
+# audiopus_sys vendors an older Opus CMake project; keep it buildable with CMake 4.
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"

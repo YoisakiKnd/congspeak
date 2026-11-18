@@ -1,0 +1,22 @@
+[package]
+name = "congspeak-native"
+version = "0.5.9"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+eframe = { version = "=0.37.0", default-features = false, features = ["glow", "default_fonts", "system_fonts", "accesskit", "x11", "wayland"] }
+congspeak-core.workspace = true
+congspeak-teamspeak.workspace = true
+congspeak-audio = { path = "../../crates/audio", features = ["runtime"] }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dirs = "6"
+tempfile = "3"
+global-hotkey = "0.8"
+uuid = { version = "1", features = ["serde"] }
+
+[build-dependencies]
+winresource = "0.1"
+static_vcruntime = "3"

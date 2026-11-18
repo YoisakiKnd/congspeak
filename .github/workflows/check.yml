@@ -1,0 +1,46 @@
+name: Checks
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '14.2'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libasound2-dev libssl-dev libudev-dev libxkbcommon-dev libwayland-dev libfontconfig1-dev libegl1-mesa-dev
+      - name: Rust toolchain
+        run: rustup show
+      - run: cargo fmt --all -- --check
+      - run: cargo test --locked -p congspeak-core -p congspeak-teamspeak -p congspeak-audio -p congspeak-native
+      - run: cargo clippy --locked -p congspeak-probe -p congspeak-native --all-targets -- -D warnings
+
+  dsp:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '14.2'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev meson ninja-build pkg-config clang
+      - name: macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew install meson ninja pkgconf
+      - run: rustup show
+      - run: cargo run --locked -p congspeak-audio --example audio_probe --features webrtc --release
