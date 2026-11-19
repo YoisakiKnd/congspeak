@@ -1,6 +1,6 @@
 use crate::playback::Playback;
 use crate::{FRAME_SAMPLES, Frame, RnNoise};
-use audiopus::{Application, Bitrate, Channels, SampleRate, coder::Encoder};
+use audiopus::{Application, Bitrate, Channels, SampleRate, Signal, coder::Encoder};
 use congspeak_core::{AudioDevice, AudioSettings, AudioStatus, NoiseMode, TalkMode};
 use cpal::{
     FromSample, Sample, SampleFormat, SizedSample,
@@ -197,14 +197,34 @@ where
     let progress = health.clone();
     d.build_input_stream(
         *c,
-        move |data: &[T], _| {
+        move |data: &[T], info| {
             if !data.is_empty() {
+                let stamp = info.timestamp();
+                progress
+                    .delay_ms
+                    .store(delay_ms(stamp.callback, stamp.capture), Ordering::Relaxed);
                 progress.callbacks.fetch_add(1, Ordering::Relaxed);
             }
+            let mut lost = 0;
+            let mut clipped = 0;
             for frame in data.chunks_exact(channels) {
                 let value =
                     frame.iter().map(|s| f32::from_sample(*s)).sum::<f32>() / channels as f32;
-                let _ = prod.try_push(if value.is_finite() { value } else { 0. });
+                clipped += u64::from(value.abs() >= 0.999);
+                if prod
+                    .try_push(if value.is_finite() { value } else { 0. })
+                    .is_err()
+                {
+                    lost += 1;
+                }
+            }
+            if clipped > 0 {
+                progress
+                    .clipped_samples
+                    .fetch_add(clipped, Ordering::Relaxed);
+            }
+            if lost > 0 {
+                progress.dropped_samples.fetch_add(lost, Ordering::Relaxed);
             }
         },
         move |error| {
@@ -231,8 +251,12 @@ where
     let progress = health.clone();
     d.build_output_stream(
         *c,
-        move |data: &mut [T], _| {
+        move |data: &mut [T], info| {
             if !data.is_empty() {
+                let stamp = info.timestamp();
+                progress
+                    .delay_ms
+                    .store(delay_ms(stamp.playback, stamp.callback), Ordering::Relaxed);
                 progress.callbacks.fetch_add(1, Ordering::Relaxed);
             }
             for frame in data.chunks_mut(channels) {
@@ -277,10 +301,19 @@ macro_rules! format_stream {
         _ => Err("设备采样格式暂不支持".into())
     }};
 }
+fn delay_ms(later: cpal::StreamInstant, earlier: cpal::StreamInstant) -> u64 {
+    later
+        .checked_duration_since(earlier)
+        .map_or(0, |d| d.as_millis().min(500) as u64)
+}
+
 #[derive(Default)]
 struct StreamHealth {
     failed: AtomicBool,
     callbacks: AtomicU64,
+    delay_ms: AtomicU64,
+    clipped_samples: AtomicU64,
+    dropped_samples: AtomicU64,
 }
 struct CallbackWatch {
     last: u64,
@@ -394,6 +427,7 @@ pub struct Processor {
     apm: sonora::AudioProcessing,
     rnnoise: Option<RnNoise>,
     vad: Option<VoiceActivityDetectorWrapper>,
+    input_gain: f32,
     settings: AudioSettings,
 }
 impl Processor {
@@ -447,6 +481,7 @@ impl Processor {
             rnnoise: (settings.noise_mode == NoiseMode::Rnnoise).then(RnNoise::default),
             vad: (settings.talk_mode == TalkMode::VoiceActivation)
                 .then(|| VoiceActivityDetectorWrapper::new(sonora_simd::detect_backend(), 48_000)),
+            input_gain: settings.input_gain,
             settings: settings.clone(),
         }
     }
@@ -459,13 +494,37 @@ impl Processor {
             .process_render_f32(&[frame], &mut [&mut output])
             .map_err(|e| e.to_string())
     }
+    fn set_echo_delay(&mut self, millis: u16) {
+        let delay = i32::from(millis);
+        if self.apm.stream_delay_ms() != delay {
+            let _ = self.apm.set_stream_delay_ms(delay);
+        }
+    }
+
     pub fn capture(&mut self, frame: &mut Frame) -> Result<Option<f32>, String> {
         if frame.iter().any(|s| !s.is_finite()) {
             return Err("麦克风处理信号包含无效采样".into());
         }
         let mut source = *frame;
-        for s in &mut source {
-            *s = (*s * self.settings.input_gain).clamp(-1., 1.);
+        let peak = source.iter().map(|s| s.abs()).fold(0., f32::max);
+        let target = self
+            .settings
+            .input_gain
+            .min(0.97 / peak.max(f32::MIN_POSITIVE));
+        // Lower the gain before an over-range frame can clip. Recover over several
+        // frames to avoid modulating each waveform peak independently.
+        if target < self.input_gain {
+            self.input_gain = target;
+            for sample in &mut source {
+                *sample *= target;
+            }
+        } else {
+            let start = self.input_gain;
+            self.input_gain += (target - start) * 0.04;
+            let step = (self.input_gain - start) / FRAME_SAMPLES as f32;
+            for (index, sample) in source.iter_mut().enumerate() {
+                *sample *= start + (index + 1) as f32 * step;
+            }
         }
         // RNNoise runs after AEC and before AGC; APM NS is disabled in this mode.
         self.apm
@@ -549,8 +608,20 @@ impl RecoveringProcessor {
     fn render(&mut self, frame: &Frame) -> Result<(), String> {
         self.process(|processor| processor.render(frame))
     }
-    fn capture(&mut self, frame: &mut Frame) -> Result<Option<f32>, String> {
-        self.process(|processor| processor.capture(frame))
+    fn capture(
+        &mut self,
+        frame: &mut Frame,
+        echo_delay: Option<u16>,
+    ) -> Result<Option<f32>, String> {
+        self.process(|processor| {
+            if let Some(delay) = echo_delay {
+                processor.set_echo_delay(delay);
+            }
+            processor.capture(frame)
+        })
+    }
+    fn applied_gain(&self) -> Option<f32> {
+        self.inner.as_ref().map(|processor| processor.input_gain)
     }
     fn reset(&mut self, settings: &AudioSettings, preview: bool) {
         let recoveries = self.recoveries;
@@ -607,12 +678,27 @@ impl VoiceGate {
 fn rms(samples: &[f32]) -> f32 {
     (samples.iter().map(|s| s * s).sum::<f32>() / samples.len().max(1) as f32).sqrt()
 }
-fn encoded_sender() -> Result<Encoder, String> {
-    let mut encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip)
-        .map_err(|e| e.to_string())?;
+fn encoded_sender(music: bool) -> Result<Encoder, String> {
+    let mut encoder = Encoder::new(
+        SampleRate::Hz48000,
+        Channels::Mono,
+        if music {
+            Application::Audio
+        } else {
+            Application::Voip
+        },
+    )
+    .map_err(|e| e.to_string())?;
     encoder
         .set_bitrate(Bitrate::BitsPerSecond(32000))
         .map_err(|e| e.to_string())?;
+    if !music {
+        encoder
+            .set_signal(Signal::Voice)
+            .map_err(|e| e.to_string())?;
+        encoder.set_inband_fec(true).map_err(|e| e.to_string())?;
+        encoder.set_packet_loss_perc(8).map_err(|e| e.to_string())?;
+    }
     Ok(encoder)
 }
 
@@ -783,6 +869,9 @@ fn worker(
                             sending = false;
                             previous.fill([0.; FRAME_SAMPLES]);
                         }
+                        if music != m {
+                            encoder = None;
+                        }
                         can_send = send;
                         can_receive = receive;
                         music = m;
@@ -837,6 +926,7 @@ fn worker(
             state.input_level = 0.;
             state.raw_input_level = 0.;
             state.voice_probability = None;
+            state.applied_input_gain = None;
         }
         if !need_output {
             output = None;
@@ -950,15 +1040,48 @@ fn worker(
                 out.reference.skip(out.reference.occupied_len());
             }
         }
+        state.echo_delay_ms = (settings.echo_cancellation && !preview)
+            .then(|| input.as_ref().zip(output.as_ref()))
+            .flatten()
+            .map(|(capture, playback)| {
+                (capture.health.delay_ms.load(Ordering::Relaxed)
+                    + playback.health.delay_ms.load(Ordering::Relaxed))
+                .min(500) as u16
+            });
         if let Some(capture) = &mut input {
-            while let Some(sample) = capture.samples.try_pop() {
-                input_resample.push(sample, capture.rate, 48000, |s| input_pcm.push_back(s));
+            state.input_clipped_samples +=
+                capture.health.clipped_samples.swap(0, Ordering::Relaxed);
+            let lost = capture.health.dropped_samples.swap(0, Ordering::Relaxed);
+            if lost > 0 {
+                let stale = capture.samples.occupied_len();
+                capture.samples.skip(stale);
+                state.capture_dropped_samples += lost + stale as u64 + input_pcm.len() as u64;
+                input_resample = Resampler::default();
+                input_pcm.clear();
             }
-            // Never send stale audio after a worker stall.
-            if trim_capture_backlog(&mut input_pcm) {
-                state.recovery_notice = Some("采集发生积压，已丢弃旧数据并继续处理最新声音".into());
+            while let Some(sample) = capture.samples.try_pop() {
+                input_resample.push(sample, capture.rate, 48_000, |s| input_pcm.push_back(s));
+            }
+            let queued = input_pcm.len();
+            let trimmed = trim_capture_backlog(&mut input_pcm);
+            if trimmed || lost > 0 {
+                state.capture_dropped_samples += (queued - input_pcm.len()) as u64;
+                // A sample gap must end the current Opus burst so the decoder can start fresh.
+                // Do not carry buffered syllables across a gap in the device stream.
+                if sending {
+                    let _ = outgoing.try_send(EncodedAudio {
+                        epoch,
+                        created: Instant::now(),
+                        bytes: Vec::new(),
+                        music: music == Some(true),
+                    });
+                }
+                sending = false;
                 speech.clear();
                 previous.fill([0.; FRAME_SAMPLES]);
+                encoder = None;
+                gate = VoiceGate::default();
+                state.recovery_notice = Some("采集发生积压，已从新的音频帧恢复".into());
             }
             while input_pcm.len() >= FRAME_SAMPLES {
                 let mut frame = [0.; FRAME_SAMPLES];
@@ -966,7 +1089,7 @@ fn worker(
                     *s = input_pcm.pop_front().unwrap();
                 }
                 state.raw_input_level = rms(&frame);
-                let probability = match processor.capture(&mut frame) {
+                let probability = match processor.capture(&mut frame, state.echo_delay_ms) {
                     Ok(probability) => probability,
                     Err(e) => {
                         state.processing_error = Some(e);
@@ -988,6 +1111,7 @@ fn worker(
                     }
                 };
                 state.voice_probability = probability;
+                state.applied_input_gain = processor.applied_gain();
                 state.processing_error = None;
                 state.dsp_recoveries = processor.recoveries;
                 state.input_level = rms(&frame);
@@ -1011,7 +1135,7 @@ fn worker(
                         let mut encoded = [0u8; 1275];
                         let result = (|| {
                             if encoder.is_none() {
-                                let mut new_encoder = encoded_sender()?;
+                                let mut new_encoder = encoded_sender(music == Some(true))?;
                                 new_encoder
                                     .set_bitrate(Bitrate::BitsPerSecond(bitrate))
                                     .map_err(|e| e.to_string())?;
@@ -1194,7 +1318,7 @@ mod tests {
                     ..Default::default()
                 };
                 let mut dsp = RecoveringProcessor::new(&settings, false);
-                assert!(dsp.capture(&mut [f32::NAN; FRAME_SAMPLES]).is_err());
+                assert!(dsp.capture(&mut [f32::NAN; FRAME_SAMPLES], None).is_err());
                 thread::sleep(Duration::from_millis(120));
                 let mut gate = VoiceGate::default();
                 let mut open = 0;
@@ -1203,7 +1327,7 @@ mod tests {
                         ((i * FRAME_SAMPLES + n) as f32 * 0.0576).sin() * 0.05
                     });
                     dsp.render(&[0.; FRAME_SAMPLES]).unwrap();
-                    assert!(dsp.capture(&mut voice).unwrap().is_some());
+                    assert!(dsp.capture(&mut voice, None).unwrap().is_some());
                     if gate.open(&settings, false, Some(0.95)) {
                         open += 1;
                     }
@@ -1229,7 +1353,7 @@ mod tests {
                 let mut dsp = RecoveringProcessor::new(&settings, false);
                 let mut playback = Playback::new();
                 let mut gate = VoiceGate::default();
-                let encoder = encoded_sender().unwrap();
+                let encoder = encoded_sender(false).unwrap();
                 let source: Vec<_> = (0..960).map(|n| (n as f32 * 0.0576).sin() * 0.02).collect();
                 let mut bytes = [0; 1275];
                 let len = encoder.encode_float(&source, &mut bytes).unwrap();
@@ -1257,7 +1381,7 @@ mod tests {
                     let mut capture = std::array::from_fn(|n| {
                         ((i * FRAME_SAMPLES + n) as f32 * 0.035).sin() * 0.12
                     });
-                    assert!(dsp.capture(&mut capture).unwrap().is_some());
+                    assert!(dsp.capture(&mut capture, None).unwrap().is_some());
                     if gate.open(&settings, false, Some(0.95)) && i > 900 {
                         open_at_end += 1;
                     }
@@ -1396,13 +1520,67 @@ mod tests {
     }
 
     #[test]
+    fn high_input_gain_preserves_waveform_and_recovers_gradually() {
+        thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let settings = AudioSettings {
+                    input_gain: 3.,
+                    noise_mode: NoiseMode::Off,
+                    auto_gain: false,
+                    echo_cancellation: false,
+                    ..Default::default()
+                };
+                let mut processor = Processor::new(&settings, false);
+                let tone = |i: usize| (i as f32 * std::f32::consts::TAU / 48.).sin();
+                let mut output = [0.; FRAME_SAMPLES];
+                for _ in 0..12 {
+                    output = std::array::from_fn(|i| tone(i) * 0.7);
+                    processor.capture(&mut output).unwrap();
+                }
+                let fundamental = output
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| s * tone(i))
+                    .sum::<f32>();
+                let third = output
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| s * tone(i * 3))
+                    .sum::<f32>();
+                assert!(fundamental.abs() > 150.);
+                assert!(
+                    third.abs() / fundamental.abs() < 0.02,
+                    "unexpected clipping harmonic"
+                );
+                assert!(processor.input_gain < settings.input_gain);
+                let limited = processor.input_gain;
+                processor.capture(&mut [0.01; FRAME_SAMPLES]).unwrap();
+                assert!(processor.input_gain > limited && processor.input_gain < limited + 0.1);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn opus_loss_resilience_is_enabled_only_for_voice_channels() {
+        let voice = encoded_sender(false).unwrap();
+        assert!(voice.inband_fec().unwrap());
+        assert_eq!(voice.packet_loss_perc().unwrap(), 8);
+        let music = encoded_sender(true).unwrap();
+        assert!(!music.inband_fec().unwrap());
+        assert_eq!(music.packet_loss_perc().unwrap(), 0);
+    }
+
+    #[test]
     fn dsp_and_opus_roundtrip() {
         thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
             .spawn(|| {
                 let settings = AudioSettings::default();
                 let mut p = Processor::new(&settings, false);
-                let encoder = encoded_sender().unwrap();
+                let encoder = encoded_sender(false).unwrap();
                 let mut decoder =
                     audiopus::coder::Decoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
                 for _ in 0..30 {

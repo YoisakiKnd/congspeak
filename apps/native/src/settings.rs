@@ -217,6 +217,19 @@ impl App {
                             "恢复：DSP {} · 设备 {} · 接收 {}",
                             a.dsp_recoveries, a.device_recoveries, a.playback_recoveries
                         ));
+                        if let Some(gain) = a.applied_input_gain {
+                            ui.label(format!("实际输入增益 ×{gain:.2}"));
+                        }
+                        if a.input_clipped_samples > 0 {
+                            ui.label(format!("设备输入触顶 {} 个采样", a.input_clipped_samples))
+                                .on_hover_text("设备采集的信号已接近满幅，可降低系统麦克风音量");
+                        }
+                        if a.capture_dropped_samples > 0 {
+                            ui.label(format!("采集丢弃 {} 个采样", a.capture_dropped_samples));
+                        }
+                        if let Some(delay) = a.echo_delay_ms {
+                            ui.label(format!("回声参考设备延时 {delay} ms"));
+                        }
                         ui.horizontal(|ui| {
                             if ui.button("重启音频（保留连接）").clicked() {
                                 let session = self.backend.session.clone();

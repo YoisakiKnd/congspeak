@@ -206,6 +206,14 @@ pub struct AudioStatus {
     #[serde(default)]
     pub voice_probability: Option<f32>,
     pub raw_input_level: f32,
+    #[serde(default)]
+    pub input_clipped_samples: u64,
+    #[serde(default)]
+    pub capture_dropped_samples: u64,
+    #[serde(default)]
+    pub applied_input_gain: Option<f32>,
+    #[serde(default)]
+    pub echo_delay_ms: Option<u16>,
     pub output_level: f32,
     pub transmitting: bool,
     pub mic_test: bool,
@@ -268,6 +276,7 @@ pub enum SessionEvent {
         sender: String,
         sender_id: u16,
         sender_uid: Option<String>,
+        channel_id: Option<String>,
         target: String,
         text: String,
     },

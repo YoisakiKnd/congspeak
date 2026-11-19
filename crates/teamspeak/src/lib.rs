@@ -47,7 +47,11 @@ enum RequestTarget {
 }
 
 enum Operation {
-    Message(ChatTarget, String),
+    Message {
+        target: ChatTarget,
+        text: String,
+        expected_channel: Option<String>,
+    },
     Action(ClientAction),
 }
 
@@ -290,7 +294,11 @@ impl Session {
     ) -> Result<(), String> {
         self.request(
             RequestTarget::ReportEvent(request_id),
-            Operation::Message(target, text),
+            Operation::Message {
+                target,
+                text,
+                expected_channel: None,
+            },
         )
         .await
     }
@@ -303,7 +311,30 @@ impl Session {
     ) -> Result<(), String> {
         self.request(
             RequestTarget::Confirm { generation, peer },
-            Operation::Message(target, text),
+            Operation::Message {
+                target,
+                text,
+                expected_channel: None,
+            },
+        )
+        .await
+    }
+    pub async fn chat_channel_confirmed(
+        &self,
+        generation: u32,
+        channel_id: String,
+        text: String,
+    ) -> Result<(), String> {
+        self.request(
+            RequestTarget::Confirm {
+                generation,
+                peer: None,
+            },
+            Operation::Message {
+                target: ChatTarget::Channel,
+                text,
+                expected_channel: Some(channel_id),
+            },
         )
         .await
     }
@@ -311,7 +342,7 @@ impl Session {
         self.chat(request_id, ChatTarget::Channel, text).await
     }
     async fn request(&self, target: RequestTarget, operation: Operation) -> Result<(), String> {
-        if let Operation::Message(_, text) = &operation
+        if let Operation::Message { text, .. } = &operation
             && (text.trim().is_empty() || text.len() > 1024 || text.contains('\0'))
         {
             return Err("消息不能为空、包含空字符或超过 1024 字节".into());
@@ -713,13 +744,18 @@ async fn run(
                                 let _ = events.send(update);
                             }
                             if let tsclientlib::events::Event::Message { target, invoker, message } = event {
-                                let sender_uid = connection.as_ref().and_then(|con| con.get_state().ok())
+                                let book = connection.as_ref().and_then(|con| con.get_state().ok());
+                                let sender_uid = book
                                     .and_then(|book|book.clients.get(&invoker.id))
                                     .and_then(|client|client.uid.as_ref())
                                     .map(|uid| uid.to_string());
+                                let channel_id = if matches!(target, MessageTarget::Channel) {
+                                    book.and_then(|book| book.clients.get(&book.own_client))
+                                        .map(|client| client.channel.0.to_string())
+                                } else { None };
                                 if sender_uid.as_ref().is_some_and(|uid| ignored_uids.contains(uid)) { continue; }
                                 let target=match target{MessageTarget::Channel=>"channel".into(),MessageTarget::Server=>"server".into(),MessageTarget::Client(id)=>format!("client:{}",if Some(id.0)==state.own_client_id{invoker.id.0}else{id.0}),MessageTarget::Poke(_)=>"poke".into()};
-                                let _ = events.send(SessionEvent::Message { generation: state.generation, sender: invoker.name,sender_id:invoker.id.0, sender_uid, target, text: message });
+                                let _ = events.send(SessionEvent::Message { generation: state.generation, sender: invoker.name,sender_id:invoker.id.0, sender_uid, channel_id, target, text: message });
                             }
                         }
                         if let Some(con) = &connection { synchronize(con, &mut state, channel_list_complete); }
@@ -1188,9 +1224,20 @@ fn submit(
             }
             build_action(con, action)?
         }
-        Operation::Message(target, text) => book.send_message(
-            match target {
-                ChatTarget::Channel => MessageTarget::Channel,
+        Operation::Message {
+            target,
+            text,
+            expected_channel,
+        } => {
+            let target = match target {
+                ChatTarget::Channel => {
+                    let current = book
+                        .clients
+                        .get(&book.own_client)
+                        .map(|client| client.channel.0);
+                    validate_chat_channel(expected_channel.as_deref(), current)?;
+                    MessageTarget::Channel
+                }
                 ChatTarget::Server => MessageTarget::Server,
                 ChatTarget::Client { client_id } => {
                     let id = tsclientlib::ClientId(*client_id);
@@ -1199,11 +1246,20 @@ fn submit(
                     }
                     MessageTarget::Client(id)
                 }
-            },
-            text,
-        ),
+            };
+            book.send_message(target, text)
+        }
     };
     packet.send_with_result(con).map_err(|e| e.to_string())
+}
+
+fn validate_chat_channel(expected: Option<&str>, current: Option<u64>) -> Result<(), String> {
+    if let Some(expected) = expected
+        && (current.is_none() || expected.parse::<u64>().ok() != current)
+    {
+        return Err("当前频道已变化，消息没有发送".into());
+    }
+    Ok(())
 }
 
 fn build_action(
@@ -1502,6 +1558,14 @@ mod preparation_tests {
         tsclientlib::Error::ConnectionFailed(tsproto::client::Error::TsProto(
             tsproto::Error::MaxLengthExceeded(queue),
         ))
+    }
+
+    #[test]
+    fn channel_chat_refuses_to_send_after_a_channel_switch() {
+        assert!(validate_chat_channel(Some("42"), Some(42)).is_ok());
+        assert!(validate_chat_channel(Some("42"), Some(43)).is_err());
+        assert!(validate_chat_channel(Some("42"), None).is_err());
+        assert!(validate_chat_channel(None, Some(43)).is_ok());
     }
 
     #[test]

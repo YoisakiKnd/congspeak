@@ -1,6 +1,6 @@
 # CongSpeak
 
-CongSpeak 是面向 Windows、macOS、Linux 的第三方 TeamSpeak 3 兼容客户端（当前版本 0.5.9）。项目独立开发，采用 MIT 许可证。[项目声明](NOTICE.md) · [MIT 许可证](LICENSE) · [功能对齐清单](docs/TS3-PARITY.md)。
+CongSpeak 是面向 Windows、macOS、Linux 的第三方 TeamSpeak 3 兼容客户端（当前版本 0.5.11）。项目独立开发，采用 MIT 许可证。[项目声明](NOTICE.md) · [MIT 许可证](LICENSE) · [功能对齐清单](docs/TS3-PARITY.md)。
 
 已实现：Rust 会话任务、真实 TS3 连接与取消/断开、频道/用户快照与频道管理、频道文件浏览与传输、多身份管理与 TS3 INI 导入导出、UID 联系人与忽略、服务器封禁列表与投诉、系统凭据身份存储接入，以及基于 Rust + egui/eframe 的紧凑原生桌面界面。
 
@@ -12,7 +12,7 @@ CongSpeak 是面向 Windows、macOS、Linux 的第三方 TeamSpeak 3 兼容客�
 
 完整路线见 [实施计划](docs/PLAN.md)，历史验证记录见 [M0 记录](docs/M0.md) 与 [原生桌面迁移记录](docs/NATIVE-DESKTOP.md)。
 
-## 启动与打包原生桌面端（0.5.9）
+## 启动与打包原生桌面端（0.5.11）
 
 首页提供最近连接和服务器收藏。默认采用 440 × 720 的竖向窗口，上方列出频道和用户，下方显示聊天和语音控制。拖动聊天上沿可调整高度。拉宽窗口可切换为左右布局，「视图 → 竖向窗口」可一键恢复。点击频道栏的「详情」可查看选中对象，窗口较窄时详情在浮窗中打开。
 
@@ -22,7 +22,7 @@ cargo run --release -p congspeak-native
 
 连接成功后会自动请求订阅频道。频道行显示人数或订阅状态，点「有人」可筛选已看到成员的频道。成员加入和退出服务器时，「事件」页会记录昵称与频道。「视图 → 加入与退出提示音」可切换本地提示音。
 
-Windows 单文件位于 `releases/windows/CongSpeak-Native-0.5.9-windows-x64.exe`。源码打包使用 `node scripts/build-native.mjs`，macOS app 包脚本为 `python3 scripts/bundle-native-macos.py`。Windows 上的 OpenGL、输入法和实际通话仍需真机验证。
+Windows 单文件位于 `releases/windows/CongSpeak-Native-0.5.11-windows-x64.exe`。源码打包使用 `node scripts/build-native.mjs`，macOS app 包脚本为 `python3 scripts/bundle-native-macos.py`。Windows 上的 OpenGL、输入法和实际通话仍需真机验证。
 
 原生版提供频道管理、频道文件浏览与传输、UID 联系人、收藏分组和当前会话聊天搜索。文件窗口可从频道右键菜单或频道信息区打开，目录创建、重命名、删除与传输操作均在文件窗口内联完成。上传与下载使用本地完整路径，上传也支持拖入文件。
 
@@ -60,7 +60,7 @@ cargo build --release -p congspeak-native
 python3 scripts/bundle-native-macos.py
 ```
 
-构建 Windows x64 单文件便携版（`releases/windows/CongSpeak-Native-0.5.9-windows-x64.exe`）：
+构建 Windows x64 单文件便携版（`releases/windows/CongSpeak-Native-0.5.11-windows-x64.exe`）：
 
 ```sh
 node scripts/build-native.mjs

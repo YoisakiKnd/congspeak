@@ -937,7 +937,7 @@ dependencies = [
 
 [[package]]
 name = "congspeak-native"
-version = "0.5.9"
+version = "0.5.11"
 dependencies = [
  "congspeak-audio",
  "congspeak-core",

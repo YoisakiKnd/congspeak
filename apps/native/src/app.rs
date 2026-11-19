@@ -29,6 +29,7 @@ struct Tab {
     title: String,
     target: Option<ChatTarget>,
     peer: Option<(u16, String)>,
+    channel_id: Option<String>,
     draft: String,
     lines: VecDeque<Line>,
     unread: usize,
@@ -41,6 +42,7 @@ impl Tab {
             title: title.into(),
             target,
             peer: None,
+            channel_id: None,
             draft: String::new(),
             lines: VecDeque::new(),
             unread: 0,
@@ -194,7 +196,6 @@ impl App {
     fn base_tabs() -> Vec<Tab> {
         vec![
             Tab::new("server", "服务器", Some(ChatTarget::Server)),
-            Tab::new("channel", "频道", Some(ChatTarget::Channel)),
             Tab::new("poke", "事件", None),
         ]
     }
@@ -309,17 +310,9 @@ impl App {
     }
 
     fn append(&mut self, key: &str, line: Line) {
-        let index = self
-            .tabs
-            .iter()
-            .position(|t| t.key == key)
-            .unwrap_or_else(|| {
-                if self.tabs.len() >= 18 {
-                    return 2;
-                }
-                self.tabs.push(Tab::new(key, key, None));
-                self.tabs.len() - 1
-            });
+        let Some(index) = self.tabs.iter().position(|tab| tab.key == key) else {
+            return;
+        };
         let tab = &mut self.tabs[index];
         tab.lines.push_back(line);
         if tab.lines.len() > 500 {
@@ -339,13 +332,96 @@ impl App {
             .map(|uid| (id, uid))
     }
 
-    fn private(&mut self, id: u16, name: &str) -> usize {
+    fn channel_tab(&mut self, id: &str) -> Option<usize> {
+        let title = self
+            .snapshot
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+            .map_or_else(|| format!("频道 #{id}"), |channel| channel.name.clone());
+        if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.channel_id.as_deref() == Some(id))
+        {
+            self.tabs[index].title = title;
+            return Some(index);
+        }
+        let mut tab = Tab::new(&format!("channel:{id}"), &title, Some(ChatTarget::Channel));
+        tab.channel_id = Some(id.into());
+        if self
+            .tabs
+            .iter()
+            .filter(|tab| tab.channel_id.is_some())
+            .count()
+            >= 24
+        {
+            let replacement = self.tabs.iter().enumerate().position(|(index, existing)| {
+                index != self.active_tab
+                    && existing.channel_id.is_some()
+                    && existing.draft.is_empty()
+                    && existing
+                        .lines
+                        .iter()
+                        .all(|line| !line.id.is_some_and(|id| self.pending.contains_key(&id)))
+            });
+            let Some(index) = replacement else {
+                self.error = Some("频道聊天标签已满，请关闭不使用的标签".into());
+                return None;
+            };
+            self.tabs[index] = tab;
+            return Some(index);
+        }
+        self.tabs.push(tab);
+        Some(self.tabs.len() - 1)
+    }
+
+    fn open_channel_chat(&mut self, id: &str) {
+        if let Some(index) = self.channel_tab(id) {
+            self.activate_chat(index);
+        }
+    }
+
+    fn activate_chat(&mut self, index: usize) {
+        let tab = &mut self.tabs[index];
+        tab.unread = 0;
+        self.active_tab = index;
+        self.chat_filter.clear();
+        if tab.key == "poke" {
+            return;
+        }
+        self.selected_client = tab.peer.as_ref().and_then(|(id, uid)| {
+            self.snapshot
+                .clients
+                .iter()
+                .any(|client| client.id == *id && client.uid.as_ref() == Some(uid))
+                .then_some(*id)
+        });
+        self.selected_channel = tab.channel_id.clone();
+    }
+
+    fn open_current_channel_chat(&mut self) {
+        if let Some(own) = self.own_client() {
+            self.open_channel_chat(&own.channel_id);
+        } else {
+            self.active_tab = 0;
+        }
+    }
+
+    fn open_client_chat(&mut self, client: &Client) {
+        if Some(client.id) == self.snapshot.own_client_id {
+            self.open_channel_chat(&client.channel_id);
+        } else if let Some(index) = self.private(client.id, &client.name) {
+            self.activate_chat(index);
+        }
+    }
+
+    fn private(&mut self, id: u16, name: &str) -> Option<usize> {
         let Some((_, uid)) = self.peer(id) else {
             self.error = Some("目前无法确认该用户身份".into());
-            return self.active_tab;
+            return None;
         };
         self.private_for_uid(id, name, uid)
-            .unwrap_or(self.active_tab)
     }
 
     fn private_for_uid(&mut self, id: u16, name: &str, uid: String) -> Option<usize> {
@@ -354,7 +430,7 @@ impl App {
             self.tabs[i].title = name.into();
             return Some(i);
         }
-        if self.tabs.len() >= 18 {
+        if self.tabs.iter().filter(|tab| tab.peer.is_some()).count() >= 16 {
             self.error = Some("私聊标签页已达上限，请先关闭不使用的私聊".into());
             return None;
         }
@@ -378,7 +454,7 @@ impl App {
         }
         if snapshot.generation != self.snapshot.generation {
             self.tabs = Self::base_tabs();
-            self.active_tab = 1;
+            self.active_tab = 0;
             self.volumes.clear();
             self.pending.clear();
             self.selected_client = None;
@@ -395,16 +471,22 @@ impl App {
                         .any(|previous| previous.id == *id && previous.uid == client.uid)
                 })
         });
-        if (self.snapshot.generation != snapshot.generation
+        let just_connected = (self.snapshot.generation != snapshot.generation
             || self.snapshot.status != ConnectionStatus::Connected)
-            && snapshot.status == ConnectionStatus::Connected
-        {
+            && snapshot.status == ConnectionStatus::Connected;
+        let previous_channel = self.own_client().map(|own| own.channel_id);
+        self.snapshot = snapshot;
+        if just_connected {
             self.backend.save_preferences(self.preferences.clone());
             self.connect_open = false;
-            self.snapshot = snapshot;
+            self.open_current_channel_chat();
             self.action("订阅可见频道", ClientAction::Subscribe { enabled: true });
-        } else {
-            self.snapshot = snapshot;
+        } else if previous_channel.is_some()
+            && self.tabs[self.active_tab].channel_id.as_ref() == previous_channel.as_ref()
+            && let Some(own) = self.own_client()
+            && Some(&own.channel_id) != previous_channel.as_ref()
+        {
+            self.open_channel_chat(&own.channel_id);
         }
         while let Ok(event) = self.backend.events.try_recv() {
             match event {
@@ -482,6 +564,7 @@ impl App {
                     sender,
                     sender_id,
                     sender_uid,
+                    channel_id,
                     mut target,
                     text,
                 }) => {
@@ -490,7 +573,13 @@ impl App {
                     {
                         continue;
                     }
-                    if target.starts_with("client:") {
+                    if target == "channel" {
+                        let Some(id) = channel_id else { continue };
+                        let Some(index) = self.channel_tab(&id) else {
+                            continue;
+                        };
+                        target = self.tabs[index].key.clone();
+                    } else if target.starts_with("client:") {
                         target = sender_uid
                             .and_then(|uid| self.private_for_uid(sender_id, &sender, uid))
                             .map_or_else(|| "poke".into(), |index| self.tabs[index].key.clone());
@@ -575,6 +664,7 @@ impl App {
     }
 
     pub fn join(&mut self, id: String) {
+        self.open_channel_chat(&id);
         if self
             .snapshot
             .channels
@@ -1046,7 +1136,7 @@ impl App {
     fn client_actions(&mut self, ui: &mut egui::Ui, client: &Client) {
         let is_own = Some(client.id) == self.snapshot.own_client_id;
         if ui.button("私聊").clicked() {
-            self.active_tab = self.private(client.id, &client.name);
+            self.open_client_chat(client);
             ui.close();
         }
         if ui.button("Poke…").clicked() {
@@ -1269,8 +1359,8 @@ impl App {
                 );
                 ui.add_space(5.);
                 if root_resp.clicked() {
-                    self.selected_channel = None;
-                    self.selected_client = None;
+                    self.activate_chat(0);
+                    ui.ctx().request_repaint();
                 }
                 root_resp.context_menu(|ui| self.server_root_menu(ui));
 
@@ -1351,8 +1441,8 @@ impl App {
                             )
                             .inner;
                         if response.clicked() {
-                            self.selected_channel = Some(channel.id.clone());
-                            self.selected_client = None;
+                            self.open_channel_chat(&channel.id);
+                            ui.ctx().request_repaint();
                         }
                         if response.double_clicked() {
                             self.join(channel.id.clone());
@@ -1441,10 +1531,8 @@ impl App {
                                 )
                                 .on_hover_text(&client.name);
                             if response.clicked() {
-                                self.selected_client = Some(client.id);
-                            }
-                            if response.double_clicked() {
-                                self.active_tab = self.private(client.id, &client.name);
+                                self.open_client_chat(&client);
+                                ui.ctx().request_repaint();
                             }
                             response.context_menu(|ui| self.client_actions(ui, &client));
                         });
@@ -1605,7 +1693,7 @@ impl App {
         ui.separator();
         ui.horizontal_wrapped(|ui| {
             if ui.button("私聊").clicked() {
-                self.active_tab = self.private(client.id, &client.name);
+                self.open_client_chat(client);
             }
             if ui.button("Poke…").clicked() {
                 self.prompt("Poke 用户", Kind::Poke(client.id), &[("消息", "", false)]);
@@ -1671,49 +1759,51 @@ impl App {
     }
 
     fn chat_content(&mut self, ui: &mut egui::Ui, compact: bool) {
-        if !compact {
-            let heading = self
-                .own_client()
-                .and_then(|own| {
-                    self.snapshot
-                        .channels
-                        .iter()
-                        .find(|c| c.id == own.channel_id)
-                })
-                .map_or("频道聊天", |c| c.name.as_str());
-            ui.heading(if self.active_tab == 1 {
-                heading
-            } else {
-                &self.tabs[self.active_tab].title
-            });
+        let current_channel = self.own_client().map(|own| own.channel_id);
+        let mut selected_tab = None;
+        ui.horizontal(|ui| {
+            if self.active_tab >= 2
+                && (self.tabs[self.active_tab].channel_id.is_none()
+                    || self.tabs[self.active_tab].channel_id != current_channel)
+                && ui
+                    .small_button("×")
+                    .on_hover_text("关闭当前聊天标签")
+                    .clicked()
+            {
+                self.tabs.remove(self.active_tab);
+                self.active_tab = 0;
+                self.open_current_channel_chat();
+            }
+            egui::ScrollArea::horizontal()
+                .id_salt("conversation-tabs")
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for (index, tab) in self.tabs.iter().enumerate() {
+                            let label = if tab.unread > 0 {
+                                format!("{} ({})", tab.title, tab.unread)
+                            } else {
+                                tab.title.clone()
+                            };
+                            if ui
+                                .selectable_label(self.active_tab == index, label)
+                                .clicked()
+                            {
+                                selected_tab = Some(index);
+                            }
+                        }
+                    });
+                });
+        });
+        if let Some(index) = selected_tab {
+            self.activate_chat(index);
+        }
+        let title = &self.tabs[self.active_tab].title;
+        if compact {
+            ui.add(egui::Label::new(RichText::new(title).strong()).truncate());
+        } else {
+            ui.heading(title);
             ui.add_space(4.);
         }
-        egui::ScrollArea::horizontal()
-            .id_salt("conversation-tabs")
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    for (i, tab) in self.tabs.iter_mut().enumerate() {
-                        let label = if tab.unread > 0 {
-                            format!("{} ({})", tab.title, tab.unread)
-                        } else {
-                            tab.title.clone()
-                        };
-                        if ui.selectable_label(self.active_tab == i, label).clicked() {
-                            self.active_tab = i;
-                            tab.unread = 0;
-                        }
-                    }
-                    if self.active_tab > 2
-                        && ui
-                            .small_button("×")
-                            .on_hover_text("关闭当前私聊标签")
-                            .clicked()
-                    {
-                        self.tabs.remove(self.active_tab);
-                        self.active_tab = 1;
-                    }
-                });
-            });
         if !compact || self.chat_search_open {
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1777,21 +1867,33 @@ impl App {
                 .iter()
                 .any(|c| c.id == *id && c.uid.as_ref() == Some(uid))
         });
-        let enabled = self.connected() && tab.target.is_some() && peer_live;
-        let hint = if peer_live {
-            "输入消息，回车发送"
-        } else {
+        let in_channel = tab
+            .channel_id
+            .as_ref()
+            .is_none_or(|id| Some(id) == current_channel.as_ref());
+        let enabled = self.connected() && tab.target.is_some() && peer_live && in_channel;
+        let hint = if !in_channel {
+            "加入此频道后才能参与聊天"
+        } else if !peer_live {
             "此用户已离开或不可见"
+        } else if tab.target.is_none() {
+            "事件记录"
+        } else {
+            "输入消息，回车发送"
         };
+        let composer_id = ui.make_persistent_id(("compose", &tab.key));
         ui.add_enabled_ui(enabled, |ui| {
             ui.horizontal(|ui| {
                 let response = ui.add_sized(
                     [ui.available_width() - 56., 24.],
                     egui::TextEdit::singleline(&mut self.tabs[self.active_tab].draft)
+                        .id(composer_id)
                         .hint_text(hint),
                 );
-                if (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                    || ui.button("发送").clicked())
+                let send_clicked = ui.button("发送").clicked();
+                if enabled
+                    && (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                        || send_clicked)
                     && !self.tabs[self.active_tab].draft.trim().is_empty()
                 {
                     let text = std::mem::take(&mut self.tabs[self.active_tab].draft);
@@ -1799,6 +1901,7 @@ impl App {
                     let target = self.tabs[self.active_tab].target.clone().unwrap();
                     let key = self.tabs[self.active_tab].key.clone();
                     let peer = self.tabs[self.active_tab].peer.clone();
+                    let channel_id = self.tabs[self.active_tab].channel_id.clone();
                     let generation = self.snapshot.generation;
                     self.append(
                         &key,
@@ -1812,7 +1915,13 @@ impl App {
                     self.pending.insert(id, "发送消息".into());
                     let session = self.backend.session.clone();
                     self.backend.request(id, async move {
-                        session.chat_confirmed(generation, peer, target, text).await
+                        if let Some(channel_id) = channel_id {
+                            session
+                                .chat_channel_confirmed(generation, channel_id, text)
+                                .await
+                        } else {
+                            session.chat_confirmed(generation, peer, target, text).await
+                        }
                     });
                     response.request_focus();
                 }
